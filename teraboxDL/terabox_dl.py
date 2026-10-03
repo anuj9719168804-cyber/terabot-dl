@@ -10,41 +10,20 @@ THIRD_PARTY_TERABOXDL_URL = os.getenv("THIRD_PARTY_TERABOXDL_URL")
 PROXY_URL = os.getenv("PROXY_URL")
 
 def _get_video_metadata(terabox_url: str) -> dict:
-    if not PROXY_URL:
-        raise Exception("PROXY_URL not found in ENV")
-        
-    if not THIRD_PARTY_TERABOXDL_URL:
-        raise Exception("THIRD_PARTY_TERABOXDL_URL not found in ENV")
+    # Direct mode: call the third-party resolver directly (no PROXY_URL chain needed).
+    base = THIRD_PARTY_TERABOXDL_URL or "https://www.teraboxdl.site/"
+    endpoint = base.rstrip("/") + "/api/proxy"
 
-    payload = {
-        "cmd": "request.post2",
-        "base_url": f"{THIRD_PARTY_TERABOXDL_URL}",
-        "post_endpoint": "api/proxy",
-        "post_json_body": f'{{"url": "{terabox_url}"}}'
-    }
-
-    # Random jitter delay to stagger concurrent requests and avoid shadow banning
     delay = random.uniform(0.1, 2.5)
-    log.info(f"Retrieving video metadata from proxy URL (jitter delay: {delay:.2f}s)")
+    log.info(f"Retrieving video metadata from resolver (jitter delay: {delay:.2f}s)")
     time.sleep(delay)
 
-    response = requests.post(PROXY_URL, json=payload, timeout=600)
+    response = requests.post(endpoint, json={"url": terabox_url}, timeout=120)
 
     if response.status_code != 200:
-        raise Exception(f"Proxy request failed with status code {response.status_code}")
+        raise Exception(f"Resolver request failed with status code {response.status_code}")
 
-    response_dict = response.json()
-    log.info(f"Time taken: {response_dict['time_taken']}, for proxy URL to return data")
-    
-    target_url_response = response_dict.get("target_url_response")
-    if not target_url_response:
-        raise Exception(f"Missing 'target_url_response' in proxy response: {response_dict}")
-
-    body = target_url_response.get("body")
-    if body is None:
-        raise Exception(f"Missing 'body' in target_url_response: {target_url_response}")
-
-    return body
+    return response.json()
 
 def _get_file_size_bytes(stream_download_url: str) -> int:
     try:
@@ -74,6 +53,50 @@ def get_video_info(terabox_url: str, is_hd: bool) -> dict:
         raise Exception("Video list not found or empty in metadata response")
 
     file_info = data["list"][0]
+
+    # Folder-aware: walk directories via ?dir= to find the first video file.
+    VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
+    def _is_video(f):
+        return str(f.get("server_filename", "")).lower().endswith(VIDEO_EXTS)
+
+    def _has_link(f):
+        return bool(f.get("stream_url") or f.get("direct_link"))
+
+    if not file_info.get("isdir") and not _is_video(file_info):
+        # Root contains mixed files (e.g. images first) → pick first downloadable file
+        for f in data["list"]:
+            if _has_link(f):
+                file_info = f
+                break
+        else:
+            raise Exception(
+                "No downloadable file found in this share link."
+            )
+
+    if file_info.get("isdir"):
+        from urllib.parse import quote
+        base_url = terabox_url.split("?")[0]
+        candidates = [f for f in data["list"] if f.get("isdir")]
+        found = None
+        visited = 0
+        queue = [c["path"] for c in candidates]
+        while queue and not found and visited < 30:
+            dirpath = queue.pop(0)
+            visited += 1
+            sub = _get_video_metadata(base_url + "?dir=" + quote(dirpath))
+            for f in sub.get("list", []):
+                if f.get("isdir"):
+                    queue.append(f["path"])
+                elif str(f.get("server_filename", "")).lower().endswith(
+                        (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")):
+                    found = f
+                    break
+        if not found:
+            raise Exception(
+                "No video file found inside this folder link. "
+                "Share the link of the video FILE itself."
+            )
+        file_info = found
 
     if is_hd:
         return {

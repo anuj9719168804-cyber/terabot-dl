@@ -103,8 +103,49 @@ async def helper(event, terabox_url: str, is_hd: bool) -> None:
     # — Phase 2: Prepare metadata ——————————————————————————————————————————
     await _safe_send(status.edit, f"⏳ Fetching metadata…", buttons=cancel_btn)
 
-    #! GET FILE INFO
+    #! GET FILE INFO — with folder-number-selection
     try:
+        from .folder_select import list_folder_videos, store_pending
+        from teraboxDL.terabox_dl import _get_video_metadata as _peek
+
+        def _peek_meta():
+            try:
+                return _peek(terabox_url)
+            except Exception:
+                return None
+
+        peek = await asyncio.to_thread(_peek_meta)
+        DL_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v",
+                   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+        _many_videos = (
+            peek is not None and peek.get("list") and
+            sum(1 for f in peek["list"] if not f.get("isdir")
+                and str(f.get("server_filename","")).lower().endswith(DL_EXTS)) > 1
+        )
+        if _many_videos:
+            # Root itself lists multiple videos → number selection over them
+            from .folder_select import list_folder_videos as _lfv, show_folder_page, store_pending
+            base_url, videos = await asyncio.to_thread(_lfv, terabox_url)
+            if len(videos) > 1:
+                chat_store_ok = True
+                store_pending(chat_id, surl, base_url, videos)
+                await show_folder_page(status.edit, chat_id, surl, videos, page=0,
+                                       reply_to_msg=event.message.id if hasattr(event, "message") else None)
+                active_tasks.pop(task_key, None)
+                return
+        if peek is not None and peek.get("list") and peek["list"][0].get("isdir"):
+            from .folder_select import list_folder_videos, show_folder_page, store_pending
+            base_url, videos = await asyncio.to_thread(list_folder_videos, terabox_url)
+            if not videos:
+                await _safe_send(status.edit, "❌ No video files found inside this folder link.")
+                active_tasks.pop(task_key, None)
+                return
+            store_pending(chat_id, surl, base_url, videos)
+            await show_folder_page(status.edit, chat_id, surl, videos, page=0,
+                                   reply_to_msg=event.message.id if hasattr(event, "message") else None)
+            active_tasks.pop(task_key, None)
+            return  # wait for user's pick
+
         info = await asyncio.to_thread(get_video_info, terabox_url, is_hd)
     except Exception as e:
         log.error(f"Metadata fetch failed for surl={surl}: {e}")

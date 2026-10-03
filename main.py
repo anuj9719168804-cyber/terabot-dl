@@ -41,7 +41,7 @@ load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 APP_ID = int(os.environ.get("APP_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
-STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID", "0"))
+STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID") or 0)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO,

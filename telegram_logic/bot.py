@@ -29,7 +29,7 @@ async def _safe_send(*args, **kwargs):
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 APP_ID = int(os.environ.get("APP_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
-STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID", "0"))
+STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID") or 0)
 
 # — Active-task tracking (for cancel) ————————————————————————————————————————————
 active_tasks: dict[tuple[int, str], threading.Event] = {}
