@@ -193,8 +193,8 @@ API_HASH=your_telegram_api_hash
 STORAGE_GROUP_ID=-1001234567890         # numeric ID of a private storage supergroup
 ADMIN_ID=12345678                       # your user ID to access /broadcast and /recent
 
-# Firebase Firestore (service-account JSON as a single-line string)
-FIREBASE_SECRETS={"type":"service_account", ... }
+# Local SQLite database is used automatically (firebase_db/local.db) — no
+# Firebase setup needed.
 
 # Experimental (/exp, /exphd) scraper proxy
 THIRD_PARTY_TERABOXDL_URL=https://www.teraboxdl.site/
@@ -207,15 +207,22 @@ DISKWALA_API_KEY=your_diskwala_api_key  # sent as the x-api-key request header
 # Traditional (/get) cookies (browser Cookie header string)
 COOKIES1=browserid=...; TSID=...
 COOKIES2=...
+
+# Download storage (download-only: finished files stay on disk, nothing is
+# uploaded back to Telegram)
+DOWNLOAD_DIR=./downloads        # base dir; each link+date gets its own subfolder: DOWNLOAD_DIR/<link-id>_<YYYY-MM-DD>/
+CLEANUP_DAYS=7                  # auto-delete files older than N days (0 = off)
 ```
 
 - `BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
 - `APP_ID` / `API_HASH` — from [my.telegram.org](https://my.telegram.org)
 - `STORAGE_GROUP_ID` — must be a supergroup ID (starts with `-100`). The bot must be admin.
-- `FIREBASE_SECRETS` — the Firestore service-account JSON, collapsed to one line; persists users, modes, and the video cache.
+- User data and the video cache are stored in a local SQLite database (`firebase_db/local.db`, created automatically) — no Firebase setup needed.
 - `THIRD_PARTY_TERABOXDL_URL` / `PROXY_URL` — endpoints the experimental (`/exp`, `/exphd`) pipeline uses to resolve TeraBox links.
 - `DISKWALA_PROXY_URL` / `DISKWALA_API_KEY` — the Diskwala (`/dw`) proxy endpoint and its `x-api-key`.
 - `COOKIES1..N` — TeraBox session cookies for the traditional (`/get`) pipeline.
+- `DOWNLOAD_DIR` — base directory for finished downloads (default: `./downloads`). Every link gets its own dated subfolder named after the link id plus the WIB download date (`DOWNLOAD_DIR/<link-id>_<YYYY-MM-DD>/`), so files from different links — or the same link downloaded on different days — never mix.
+- `CLEANUP_DAYS` — automatically delete downloaded files older than N days (default `7`; set `0` to disable). Empty per-link folders are pruned too.
 
 ### 4. Add cookies (For Traditional Mode)
 

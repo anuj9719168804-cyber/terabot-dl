@@ -128,6 +128,44 @@ async def handle_message(event):
     return
 # — Telegram bot runner ——————————————————————————————————————————————————————————————————————
 
+async def run_forever() -> None:
+    """
+    Supervisor loop: if run_until_disconnected() ever returns (Telethon's
+    mid-session _reconnect gave up after the egress proxy refused), restart
+    the client instead of letting the process die silently.
+    """
+    backoff = 10
+    while True:
+        try:
+            await run_bot()
+        except Exception as e:
+            log.error(f"run_bot crashed: {e}")
+        log.warning(f"Bot disconnected — restarting in {backoff}s...")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+        try:
+            if bot.is_connected():
+                await bot.disconnect()
+        except Exception:
+            pass
+
+
+async def cleanup_loop() -> None:
+    """Delete downloads older than CLEANUP_DAYS every hour."""
+    from telegram_logic.download_store import cleanup_old_downloads, CLEANUP_DAYS
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if CLEANUP_DAYS and CLEANUP_DAYS > 0:
+                deleted, freed = await asyncio.to_thread(cleanup_old_downloads)
+                if deleted:
+                    log.info(f"Auto-cleanup: {deleted} files, {freed/1024/1024:.1f} MB freed")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning(f"cleanup_loop error: {e}")
+
+
 async def run_bot() -> None:
     if not BOT_TOKEN or not APP_ID or not API_HASH:
         log.error("ERROR: Set BOT_TOKEN, APP_ID, and API_HASH in your .env file!")
@@ -144,6 +182,7 @@ async def run_bot() -> None:
         BotCommand(command="exphd", description="[Experimental] Download HD TeraBox video"), 
         BotCommand(command="get", description="Download TeraBox video [Unstable]"),
         BotCommand(command="dw", description="Download Diskwala video"),
+        BotCommand(command="queue", description="Show active downloads"),
         BotCommand(command="random", description="Get a random video"),
         BotCommand(command="settings", description="View Details"),
         BotCommand(command="op", description="Send feedback to admin"),
@@ -182,13 +221,15 @@ async def run_bot() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bot_task = asyncio.create_task(run_bot())
+    bot_task = asyncio.create_task(run_forever())
+    janitor_task = asyncio.create_task(cleanup_loop())
     yield
-    bot_task.cancel()
-    try:
-        await bot_task
-    except asyncio.CancelledError:
-        pass
+    for t in (bot_task, janitor_task):
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     if bot.is_connected():
         await bot.disconnect()
     log.info("Bye!")

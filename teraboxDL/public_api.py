@@ -15,8 +15,58 @@ STORAGE_DIR = "storage"
 CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB per read chunk within each part
 
 # Number of parallel parts to split a single download into.
-# 4 connections → ~4x throughput on CDNs that allow range requests.
-PARALLEL_PARTS = 4
+# 8 connections → ~8x throughput on CDNs that allow range requests.
+PARALLEL_PARTS = 8
+
+# Resume support: a manifest.json is kept next to the .parts dir so an
+# interrupted multipart download can continue instead of starting over.
+# (TeraBox URLs are signed/expiring, so resume works within the URL window.)
+import hashlib as _hashlib
+import json as _json
+
+
+def _manifest_path(part_dir: str) -> str:
+    return os.path.join(part_dir, "manifest.json")
+
+
+def _url_fingerprint(download_url: str) -> str:
+    return _hashlib.sha256(download_url.encode("utf-8", errors="ignore")).hexdigest()[:32]
+
+
+def _load_manifest(part_dir: str, download_url: str, total_size: int):
+    """Return set of completed part indexes if a valid resume manifest exists."""
+    mp = _manifest_path(part_dir)
+    try:
+        with open(mp) as f:
+            m = _json.load(f)
+    except Exception:
+        return set()
+    if (m.get("url_fp") != _url_fingerprint(download_url)
+            or m.get("total_size") != total_size
+            or m.get("parts") != PARALLEL_PARTS):
+        return set()
+    done = set()
+    for i, (start, end) in enumerate(m.get("ranges", [])):
+        p = os.path.join(part_dir, f"part_{i}")
+        try:
+            if os.path.getsize(p) == (end - start + 1):
+                done.add(i)
+        except OSError:
+            pass
+    return done
+
+
+def _save_manifest(part_dir: str, download_url: str, total_size: int, ranges) -> None:
+    try:
+        with open(_manifest_path(part_dir), "w") as f:
+            _json.dump({
+                "url_fp": _url_fingerprint(download_url),
+                "total_size": total_size,
+                "parts": PARALLEL_PARTS,
+                "ranges": [list(r) for r in ranges],
+            }, f)
+    except Exception:
+        pass
 
 # Browser-identical headers — this is the #1 reason for throttling.
 # TeraBox CDN checks User-Agent and throttles python-requests to ~100KB/s.
@@ -188,8 +238,17 @@ def _download_video_multipart(
     os.makedirs(part_dir, exist_ok=True)
     part_paths = [os.path.join(part_dir, f"part_{i}") for i in range(PARALLEL_PARTS)]
 
+    # — Resume: skip parts already fully downloaded in a previous attempt —
+    _save_manifest(part_dir, download_url, total_size, ranges)
+    resumed_parts = _load_manifest(part_dir, download_url, total_size)
+    todo = [i for i in range(PARALLEL_PARTS) if i not in resumed_parts]
+    if resumed_parts:
+        print(f"    [Resume] {len(resumed_parts)}/{PARALLEL_PARTS} parts already done, "
+              f"continuing with {len(todo)} remaining.")
+
     progress_lock = threading.Lock()
-    shared_progress = [0]  # mutable list so threads can update
+    # seed progress with bytes of already-done parts so % doesn't jump backwards
+    shared_progress = [sum(ranges[i][1] - ranges[i][0] + 1 for i in resumed_parts)]
     start_time = time.time()
 
     try:
@@ -209,7 +268,7 @@ def _download_video_multipart(
                     cancel_event,
                     progress_callback,
                 ): i
-                for i in range(PARALLEL_PARTS)
+                for i in todo
             }
             for future in as_completed(futures):
                 future.result()  # re-raise any exception from the part thread
@@ -219,19 +278,24 @@ def _download_video_multipart(
             for part_path in part_paths:
                 with open(part_path, "rb") as p:
                     shutil.copyfileobj(p, out)
-    finally:
-        # Clean up temp parts regardless of success/failure
-        for pp in part_paths:
-            if os.path.exists(pp):
-                try:
-                    os.remove(pp)
-                except Exception:
-                    pass
-        if os.path.exists(part_dir):
+    except Exception:
+        # KEEP part files + manifest on failure so the next attempt resumes.
+        print("    [Resume] download interrupted — part files kept for resume.")
+        raise
+    # Clean up temp parts only on success
+    for pp in part_paths:
+        if os.path.exists(pp):
             try:
-                os.rmdir(part_dir)
+                os.remove(pp)
             except Exception:
                 pass
+    try:
+        mp = _manifest_path(part_dir)
+        if os.path.exists(mp):
+            os.remove(mp)
+        os.rmdir(part_dir)
+    except Exception:
+        pass
 
 
 def _download_video(

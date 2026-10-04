@@ -12,13 +12,13 @@ from urllib.parse import quote
 
 from telethon import Button, events
 
-from .bot import bot, _find_cached_video, _safe_send, active_tasks
+from .bot import bot, _safe_send, active_tasks, download_progress
 from .helpers import format_size, format_duration
-from .progress_callbacks import make_download_progress_cb, make_upload_progress_cb
+from .progress_callbacks import make_download_progress_cb
+from .download_store import store_download, notify_done
 from .terabox_exp import helper as exp_helper
 from teraboxDL.terabox_dl import _get_video_metadata
 from teraboxDL.public_api import TeraBoxError
-from firebase_db.cache import add_to_cache
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ async def show_folder_page(edit_fn, chat_id: int, surl: str, videos: list, page:
     if nav:
         buttons.append(nav)
     buttons.append([Button.inline(f"⬇️ Download Semua ({len(videos)} video)", data=f"pickall:{surl}")])
-    buttons.append([Button.inline(f"🗜️ Download Semua sebagai ZIP ({len(videos)} video)", data=f"pickzip:{surl}")])
+    buttons.append([Button.inline(f"⚡ Download Semua Paralel ({len(videos)} video)", data=f"pickfast:{surl}")])
 
     # Thumbnails for this page
     _tmp_paths = []
@@ -169,13 +169,10 @@ async def handle_page(event):
     await show_folder_page(event.edit, chat_id, surl, pending["options"], page=page)
 
 
-@bot.on(events.CallbackQuery(pattern=rb"^pickzip:"))
-async def handle_pick_zip(event):
-    """Download all videos, pack into 45MB multi-volume ZIP parts, send each part."""
-    import subprocess as _sp
-    import zipfile as _zf
-
-    data = event.data.decode("utf-8", errors="ignore")  # pickzip:<surl>
+@bot.on(events.CallbackQuery(pattern=rb"^pickfast:"))
+async def handle_pick_fast(event):
+    """Download all videos in parallel (4 at a time), keep on disk, notify when done."""
+    data = event.data.decode("utf-8", errors="ignore")  # pickfast:<surl>
     surl = data.split(":", 1)[1] if ":" in data else None
     chat_id = event.chat_id
     pending = _PENDING.get((chat_id, surl))
@@ -186,88 +183,78 @@ async def handle_pick_zip(event):
     videos = pending["options"]
     base_url = pending["base_url"]
     total = len(videos)
-    await event.answer(f"🗜️ Downloading {total} videos then packing ZIP...")
+    await event.answer(f"⚡ Downloading {total} videos in parallel...")
 
-    async def _zip_all():
+    async def _dl_all():
         from teraboxDL.public_api import download_terabox_file_experimental
         import os as _os
-        workdir = f"storage/zip_{surl}_{int(time.time())}"
-        _os.makedirs(workdir, exist_ok=True)
-        ok, fail = 0, 0
         cancel_btn = [[Button.inline("❌ Cancel", data=f"cancel:{surl}")]]
-        loop = asyncio.get_running_loop()
 
-        for i, file_info in enumerate(videos):
-            try:
-                info = download_picked(base_url, file_info)
-                fname = info["filename"]
-                size_str = format_size(info["size"])
-                status = await _safe_send(
-                    event.respond,
-                    f"🗜️ ZIP **[{i+1}/{total}]** {fname}\n📐 {size_str}\n⬇️ Downloading… **0%**",
-                    buttons=cancel_btn)
-                dl_progress_cb = make_download_progress_cb(status, fname, size_str, loop, cancel_btn)
-                fp = await asyncio.to_thread(
-                    download_terabox_file_experimental, info["download_url"], fname, None, dl_progress_cb)
-                # move into workdir
-                dest = _os.path.join(workdir, _os.path.basename(fp))
-                _os.replace(fp, dest)
-                ok += 1
-            except Exception as e:
-                fail += 1
-                log.exception(f"zip-all download failed #{i+1}")
+        dl_sem = asyncio.Semaphore(4)
+        status = await _safe_send(
+            event.respond,
+            f"⚡ **{total} video**\n⬇️ Downloading paralel (4x)… **0/{total}**",
+            buttons=cancel_btn)
+        done_count = 0
+        done_lock = asyncio.Lock()
+
+        async def _dl_one(i, file_info):
+            nonlocal done_count
+            async with dl_sem:
                 try:
-                    await event.respond(f"❌ [{i+1}/{total}] Gagal: {e}")
-                except Exception:
-                    pass
+                    info = download_picked(base_url, file_info)
+                    fname = info["filename"]
+                    log.info(f"pickfast dl start [{i+1}/{total}] {fname}")
+                    fp = await asyncio.to_thread(
+                        download_terabox_file_experimental, info["download_url"], fname, None, None)
+                    final = await asyncio.to_thread(store_download, fp, fname, surl)
+                    log.info(f"pickfast dl done [{i+1}/{total}] {fname} -> {final}")
+                    return (True, fname, final)
+                except Exception as e:
+                    log.exception(f"pickfast download failed #{i+1}")
+                    return (False, file_info.get("filename", f"#{i+1}"), str(e))
+                finally:
+                    async with done_lock:
+                        done_count += 1
+                        try:
+                            await status.edit(
+                                f"⚡ **{total} video**\n⬇️ Downloading paralel (4x)… **{done_count}/{total}**",
+                                buttons=cancel_btn)
+                        except Exception:
+                            pass
 
-        if ok == 0:
-            await event.respond("❌ Tidak ada video yang berhasil didownload, ZIP dibatalkan.")
-            import shutil as _sh; _sh.rmtree(workdir, ignore_errors=True)
-            _PENDING.pop((chat_id, surl), None)
-            return
-
-        # Pack into split zip volumes (45MB parts, safe under 50MB TG limit)
-        await event.respond(f"🗜️ Packing {ok} video ke ZIP…")
-        base_zip = _os.path.join(workdir, "videos")
-        if not _os.path.isdir(workdir):
-            _os.makedirs(workdir, exist_ok=True)
-        base_zip_abs = _os.path.abspath(base_zip)
-        r = await asyncio.to_thread(
-            _sp.run, ["/usr/bin/zip", "-r", "-s", "45m", base_zip_abs + ".zip", "."],
-            cwd=workdir, capture_output=True, text=True, timeout=1800)
-        log.info(f"zip rc={r.returncode} stderr={r.stderr[:500]!r} stdout_tail={r.stdout[-300:]!r}")
-        if r.returncode != 0:
-            await event.respond(f"❌ Gagal bikin ZIP (rc={r.returncode}): {r.stderr[:300] or r.stdout[-300:]}")
-            import shutil as _sh; _sh.rmtree(workdir, ignore_errors=True)
-            _PENDING.pop((chat_id, surl), None)
-            return
-
-        # find parts: videos.z01 ... videos.zip (order matters: z01 first, .zip last)
-        import glob as _glob, re as _re
-        parts = sorted(
-            _glob.glob(base_zip + ".z[0-9][0-9]"),
-            key=lambda x: int(_re.search(r"\.z(\d+)$", x).group(1)))
-        parts.append(base_zip + ".zip")
-
-        await event.respond(f"📤 Mengirim {len(parts)} bagian ZIP… gabungkan semua file lalu ekstrak **videos.zip** terakhir.")
-        for j, part in enumerate(parts):
-            size_str = format_size(_os.path.getsize(part))
-            await event.respond(f"📤 Bagian **{j+1}/{len(parts)}** ({size_str})…")
+        results = await asyncio.gather(*[_dl_one(i, fi) for i, fi in enumerate(videos)])
+        ok = [(r[1], r[2]) for r in results if r[0]]
+        fails = [(r[1], r[2]) for r in results if not r[0]]
+        for fname, err in fails:
             try:
-                from telegram_logic.bot import bot as _b
-                await _b.send_file(chat_id, part,
-                                   caption=f"🗜️ videos.zip — bagian {j+1}/{len(parts)}",
-                                   force_document=True)
-            except Exception as e:
-                log.exception("zip part send failed")
-                await event.respond(f"❌ Gagal kirim bagian {j+1}: {e}")
+                await event.respond(f"❌ Gagal download {fname}: {err}")
+            except Exception:
+                pass
 
-        import shutil as _sh
-        _sh.rmtree(workdir, ignore_errors=True)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if ok:
+            lines = "\n".join(f"• `{_os.path.basename(p)}`" for _, p in ok[:20])
+            more = f"\n…dan {len(ok)-20} lainnya" if len(ok) > 20 else ""
+            dest_dir = _os.path.dirname(ok[0][1])  # per-link folder
+            try:
+                await event.respond(
+                    f"✅ Selesai! **{len(ok)}** video tersimpan di:\n`{dest_dir}`\n\n{lines}{more}"
+                    + (f"\n\n❌ Gagal: **{len(fails)}**" if fails else "")
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await event.respond("❌ Tidak ada video yang berhasil didownload.")
+            except Exception:
+                pass
         _PENDING.pop((chat_id, surl), None)
 
-    asyncio.create_task(_zip_all())
+    asyncio.create_task(_dl_all())
 
 
 @bot.on(events.CallbackQuery(pattern=rb"^pickall:"))
@@ -373,31 +360,44 @@ async def _run_download(event, surl: str, base_url: str, file_info: dict, seq_la
 
     loop = asyncio.get_running_loop()
     dl_start = time.time()
-    dl_progress_cb = make_download_progress_cb(status, filename, size_str, loop, cancel_btn)
+    _base_cb = make_download_progress_cb(status, filename, size_str, loop, cancel_btn)
+    prog_key = (chat_id, surl)
+    download_progress[prog_key] = {"filename": filename, "done": 0,
+                                   "total": info["size"], "started": dl_start}
+
+    def dl_progress_cb(done, total):
+        download_progress[prog_key]["done"] = done
+        if total:
+            download_progress[prog_key]["total"] = total
+        return _base_cb(done, total)
+
     try:
         filepath = await asyncio.to_thread(
             download_terabox_file_experimental, info["download_url"], filename, cancel_event, dl_progress_cb)
     except CancelledError:
         await _safe_send(status.edit, "🚫 Cancelled.")
+        download_progress.pop(prog_key, None)
         return
     except TeraBoxError as e:
         await _safe_send(status.edit, f"❌ Download failed: {e}")
+        download_progress.pop(prog_key, None)
         return
+    dl_time = time.time() - dl_start
+    download_progress.pop(prog_key, None)
 
     import os as _os
     size_str = format_size(_os.path.getsize(filepath))
 
-    dl_time = time.time() - dl_start
+    # Download-only: keep on disk, notify user (no Telegram upload)
+    try:
+        final_path = await asyncio.to_thread(store_download, filepath, filename, surl)
+    except Exception as e:
+        log.exception("store failed")
+        await _safe_send(status.edit, f"❌ Gagal menyimpan file: {e}")
+        return
 
-    # Deliver directly (no storage group configured)
-    from telegram_logic.bot import bot as _bot
-    caption = (f"📦 `{filename}`\n📐 Size: **{size_str}**\n"
-               f"⬇️ Download: **{format_duration(dl_time)}**")
     await _safe_send(status.delete)
-    await _safe_send(
-        _bot.send_file,
-        chat_id, filepath,
-        caption=caption, supports_streaming=True,
-        reply_to=event.message.id if hasattr(event, "message") else None,
+    await notify_done(
+        lambda m: _safe_send(event.respond, m),
+        filename, final_path, _os.path.getsize(final_path), dl_time,
     )
-    await asyncio.to_thread(add_to_cache, surl, 0, user_mode)  # msg_id unknown; skip caching effect

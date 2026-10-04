@@ -34,16 +34,35 @@ STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID") or 0)
 # — Active-task tracking (for cancel) ————————————————————————————————————————————
 active_tasks: dict[tuple[int, str], threading.Event] = {}
 
-# — Bot Setup ————————————————————————————————————————————————————————————— 
+# — Download progress registry (for /queue) ————————————————————————————————————
+# {(chat_id, surl): {"filename": str, "done": int, "total": int, "started": float}}
+download_progress: dict[tuple[int, str], dict] = {}
+
+# — Optional MTProto proxy (needed inside sandboxed egress) ——————————————————
+# Reads standard http://user:pass@host:port from MTPROTO_PROXY, else HTTPS_PROXY.
+def _mtproto_proxy():
+    from urllib.parse import urlparse
+    raw = os.environ.get("MTPROTO_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if not raw:
+        return None
+    u = urlparse(raw)
+    if not u.hostname:
+        return None
+    return ("http", u.hostname, u.port or 3128, True, u.username, u.password)
+
+# — Bot Setup —————————————————————————————————————————————————————————————
 
 bot = TelegramClient(
     "terabox_bot",
     APP_ID,
     API_HASH,
-    connection_retries=5,
+    # infinite retries: ride out egress-proxy blips instead of dying
+    # (keeper kept reviving the bot every ~3h after 5 failed attempts)
+    connection_retries=None,
     retry_delay=2,
     auto_reconnect=True,
     flood_sleep_threshold=0,
+    proxy=_mtproto_proxy(),
 )
 
 # — Cache helpers ——————————————————————————————————————————————————————————————
